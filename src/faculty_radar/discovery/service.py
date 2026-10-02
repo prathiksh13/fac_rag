@@ -26,7 +26,7 @@ EVIDENCE_BASED or INFERRED - STATED can only come from a curated registry.
 from __future__ import annotations
 
 from collections import Counter
-from contextlib import suppress
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -78,6 +78,10 @@ class DiscoveryResult:
     cached: bool
     works_retrieved: int
     api_calls: int
+    crossref_checked: int = 0
+    crossref_verified: int = 0
+    crossref_enriched: int = 0
+    crossref_mismatched: int = 0
 
 
 @dataclass
@@ -146,12 +150,12 @@ class DiscoveryService:
         cached: bool,
         api_calls: int = 0,
     ) -> DiscoveryResult:
-        """Payloads -> normalized works -> resolved authors -> linked profiles."""
+        """Payloads -> Crossref check -> normalized resolution -> linked profiles."""
         works = normalize_works(payloads)
         if not works:
             return DiscoveryResult((), (), (), provider, cached, len(payloads), api_calls)
 
-        self._backfill_from_crossref(works)
+        works, crossref_stats = self._verify_and_enrich(works)
         authors = _group_authors(payloads, self.scope_ids)
         if not authors:
             return DiscoveryResult((), (), (), provider, cached, len(payloads), api_calls)
@@ -192,6 +196,7 @@ class DiscoveryService:
                 "researchers": len(resolved.researchers),
                 "profiles": len(profiles),
                 "documents": len(documents),
+                **crossref_stats,
             },
         )
         return DiscoveryResult(
@@ -202,25 +207,107 @@ class DiscoveryService:
             cached=cached,
             works_retrieved=len(payloads),
             api_calls=api_calls,
+            crossref_checked=crossref_stats["crossref_checked"],
+            crossref_verified=crossref_stats["crossref_verified"],
+            crossref_enriched=crossref_stats["crossref_enriched"],
+            crossref_mismatched=crossref_stats["crossref_mismatched"],
         )
 
-    def _backfill_from_crossref(self, works: list[NormalizedWork]) -> None:
-        """Fill missing titles/years from Crossref; failures are skipped."""
-        if self.crossref is None:
-            return
-        for work in works:
-            if work.title or not work.doi:
+    def _verify_and_enrich(
+        self, works: list[NormalizedWork]
+    ) -> tuple[list[NormalizedWork], dict[str, int]]:
+        """Verify every candidate DOI against Crossref and fill gaps.
+
+        Runs concurrently (I/O-bound) with one cached call per DOI, so even a
+        full 50-work candidate set checks in about a second. Outcomes:
+
+        * verified   - DOI resolves and titles agree;
+        * mismatched - DOI resolves but titles disagree (OpenAlex kept, flagged);
+        * enriched   - Crossref filled a missing title, year, or landing URL;
+        * everything else (no DOI, unresolvable, Crossref down) leaves the
+          OpenAlex record untouched.
+
+        `crossref=None` or `enabled=False` skips the whole step: OpenAlex-only.
+        """
+        stats = {
+            "crossref_checked": 0,
+            "crossref_verified": 0,
+            "crossref_enriched": 0,
+            "crossref_mismatched": 0,
+        }
+        if self.crossref is None or not self.crossref.enabled:
+            return works, stats
+
+        with ThreadPoolExecutor(max_workers=self.crossref.settings.max_workers) as pool:
+            verdicts = list(
+                pool.map(
+                    lambda work: (work.openalex_id, _safe_verify(self.crossref, work)),
+                    works,
+                )
+            )
+
+        by_id = {work.openalex_id: work for work in works}
+        enriched: list[NormalizedWork] = []
+        for work_id, verdict in verdicts:
+            work = by_id[work_id]
+            if verdict is None:
+                enriched.append(work)
                 continue
-            meta = self.crossref.lookup(work.doi)
-            if not meta:
+            stats["crossref_checked"] += 1
+            if not verdict["resolved"]:
+                enriched.append(work)
                 continue
-            title = meta.get("title") or []
-            if title and not work.title:
-                object.__setattr__(work, "title", collapse_whitespace(str(title[0])))
-            issued = (meta.get("issued") or {}).get("date-parts") or []
-            if issued and issued[0] and work.year is None:
-                with suppress(ValueError, TypeError):
-                    object.__setattr__(work, "year", int(issued[0][0]))
+            if verdict["title_agrees"] is True:
+                stats["crossref_verified"] += 1
+            elif verdict["title_agrees"] is False:
+                stats["crossref_mismatched"] += 1
+                logger.warning(
+                    "crossref title disagrees with openalex; keeping openalex",
+                    extra={"work_id": work_id, "doi": work.doi},
+                )
+            enriched.append(_enriched_work(work, verdict, stats))
+        return enriched, stats
+
+
+def _safe_verify(crossref, work: NormalizedWork) -> dict | None:
+    """One Crossref verdict, or None when anything goes wrong.
+
+    lookup() itself never raises, but this guards the whole call so a
+    misbehaving lookup implementation can never take discovery down with it.
+    """
+    if not work.doi:
+        return None
+    try:
+        return crossref.verify(work.doi, work.title)
+    except Exception as exc:
+        logger.warning(
+            "crossref verification failed; keeping openalex record",
+            extra={"work_id": work.openalex_id, "error": str(exc)},
+        )
+        return None
+
+
+def _enriched_work(work: NormalizedWork, verdict: dict, stats: dict[str, int]) -> NormalizedWork:
+    """Return a work with Crossref-filled gaps, or the original untouched.
+
+    Only fills fields OpenAlex left empty - title, year, landing URL - and
+    only from a resolved Crossref record. Revalidates through the model so a
+    bad fill can never produce an invalid record (it would raise, loudly,
+    rather than silently corrupt the corpus).
+    """
+    overrides: dict = {}
+    if not work.title and verdict.get("title"):
+        overrides["title"] = collapse_whitespace(str(verdict["title"]))
+    if work.year is None and verdict.get("year") is not None:
+        overrides["year"] = verdict["year"]
+    if not work.locations and verdict.get("url"):
+        from faculty_radar.models import OpenLocation
+
+        overrides["locations"] = [OpenLocation(landing_page_url=verdict["url"])]
+    if not overrides:
+        return work
+    stats["crossref_enriched"] += 1
+    return NormalizedWork.model_validate({**work.model_dump(), **overrides})
 
 
 def _group_authors(payloads: list[dict[str, Any]], scope_ids: list[str]) -> list[NormalizedAuthor]:

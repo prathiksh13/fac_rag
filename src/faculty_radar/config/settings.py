@@ -124,6 +124,26 @@ class OpenAlexSettings(_Base):
     requests_per_second: float = 10.0
 
 
+class CrossrefSettings(_Base):
+    """Crossref metadata verification/enrichment for discovered publications.
+
+    Crossref is strictly secondary: OpenAlex finds candidates, Crossref only
+    confirms their DOIs and fills gaps (missing titles, years, landing URLs).
+    Everything here fails open - a dead Crossref degrades to OpenAlex-only
+    discovery, never to an error - and `enabled=False` skips it entirely.
+    """
+
+    enabled: bool = True
+    base_url: str = "https://api.crossref.org"
+    mailto: str | None = Field(
+        default=None,
+        description="Contact email for the Crossref polite pool (50 req/s).",
+    )
+    timeout_seconds: float = 8.0
+    # Concurrent verification workers; I/O-bound, so threads are appropriate.
+    max_workers: int = 8
+
+
 class ScopeSettings(_Base):
     """Which institution's faculty the engine is allowed to reason about.
 
@@ -319,6 +339,7 @@ class Settings(_Base):
     paths: PathsSettings = Field(default_factory=PathsSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     openalex: OpenAlexSettings = Field(default_factory=OpenAlexSettings)
+    crossref: CrossrefSettings = Field(default_factory=CrossrefSettings)
     scope: ScopeSettings = Field(default_factory=ScopeSettings)
     ingestion: IngestionSettings = Field(default_factory=IngestionSettings)
     embeddings: EmbeddingSettings = Field(default_factory=EmbeddingSettings)

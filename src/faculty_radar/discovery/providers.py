@@ -35,9 +35,8 @@ logger = get_logger(__name__)
 # small enough to stay fast. No bulk download, by construction.
 DEFAULT_WORKS_LIMIT = 50
 
-# Crossref politeness: one shared contact, short timeout, failures ignored.
-CROSSREF_URL = "https://api.crossref.org/works"
-CROSSREF_MAILTO = "faculty-radar-demo@example.edu"
+# Crossref politeness: a contact address joins the 50 req/s polite pool.
+# Configured via FR_CROSSREF__MAILTO; unset works, just slower.
 
 
 class DiscoveryProvider(Protocol):
@@ -120,7 +119,19 @@ class OpenAlexDiscoveryProvider:
 
 
 class CrossrefLookup:
-    """Best-effort DOI backfill. Never raises, never blocks discovery."""
+    """Best-effort DOI verification and metadata backfill. Never raises.
+
+    Two operations, one cached HTTP call each:
+    * `lookup(doi)` - raw Crossref metadata for a DOI, or None on any failure.
+    * `verify(doi, expected_title)` - does the DOI resolve, and does
+      Crossref's title agree with the title OpenAlex supplied? Agreement is
+      normalized containment either way, so subtitle and punctuation
+      differences do not count as mismatches.
+
+    Every failure mode (404, timeout, malformed JSON, unreachable host)
+    returns None / `resolved=False`. Callers treat that as "unverified",
+    never as "invalid" - OpenAlex data always wins ties.
+    """
 
     name = "crossref"
 
@@ -129,23 +140,36 @@ class CrossrefLookup:
         cache: ResponseCache | None = None,
         *,
         http_client: httpx.Client | None = None,
+        settings: Settings | None = None,
     ) -> None:
+        resolved = settings or get_settings()
+        self.settings = resolved.crossref
         self.cache = cache
-        self._client = http_client or httpx.Client(timeout=10.0)
+        self._client = http_client or httpx.Client(timeout=self.settings.timeout_seconds)
         self._owns_client = http_client is None
+
+    @property
+    def enabled(self) -> bool:
+        return self.settings.enabled
 
     def lookup(self, doi: str) -> dict[str, Any] | None:
         """Return Crossref metadata for a DOI, or None on any failure."""
         doi = (doi or "").strip()
-        if not doi:
+        if not doi or not self.enabled:
             return None
-        key = make_cache_key("CROSSREF", f"{CROSSREF_URL}/{doi}", None)
+        key = make_cache_key("CROSSREF", f"{self.settings.base_url}/works/{doi}", None)
         if self.cache is not None:
             cached = self.cache.get(key)
             if cached is not None:
                 return cached
         try:
-            response = self._client.get(f"{CROSSREF_URL}/{doi}", params={"mailto": CROSSREF_MAILTO})
+            response = self._client.get(
+                f"{self.settings.base_url.rstrip('/')}/works/{doi}",
+                params={"mailto": self.settings.mailto} if self.settings.mailto else None,
+                headers={"User-Agent": _user_agent(self.settings.mailto)},
+            )
+            if response.status_code == 404:
+                return None
             if response.is_error:
                 return None
             message = response.json().get("message") or {}
@@ -156,6 +180,61 @@ class CrossrefLookup:
             self.cache.put(key, message)
         return message
 
+    def verify(self, doi: str, expected_title: str | None) -> dict[str, Any]:
+        """Check a DOI against Crossref and compare titles.
+
+        Returns a small verdict dict; `resolved=False` means "could not
+        confirm", never "proven fake".
+        """
+        message = self.lookup(doi)
+        if not message:
+            return {"resolved": False, "title_agrees": None}
+        titles = [t for t in (message.get("title") or []) if t]
+        crossref_title = titles[0] if titles else None
+        agrees: bool | None = None
+        if crossref_title and (expected_title or "").strip():
+            left = _comparable_title(crossref_title)
+            right = _comparable_title(expected_title or "")
+            agrees = bool(left) and bool(right) and (left in right or right in left)
+        journals = [j for j in (message.get("container-title") or []) if j]
+        authors = message.get("author") or []
+        return {
+            "resolved": True,
+            "title_agrees": agrees,
+            "title": crossref_title,
+            "year": _issued_year(message),
+            "journal": journals[0] if journals else None,
+            "url": message.get("URL"),
+            "has_authors": bool(authors),
+        }
+
     def close(self) -> None:
         if self._owns_client:
             self._client.close()
+
+
+def _user_agent(mailto: str | None) -> str:
+    contact = f" (mailto:{mailto})" if mailto else ""
+    return f"faculty-radar/0.1{contact}"
+
+
+def _comparable_title(title: str) -> str:
+    """Lowercased alphanumeric-only form for agreement checks."""
+    return "".join(ch for ch in title.casefold() if ch.isalnum())
+
+
+def _issued_year(message: dict[str, Any]) -> int | None:
+    parts = (message.get("issued") or {}).get("date-parts") or []
+    if parts and parts[0]:
+        try:
+            return int(parts[0][0])
+        except (ValueError, TypeError):
+            return None
+    for key in ("published-print", "published-online", "created"):
+        parts = (message.get(key) or {}).get("date-parts") or []
+        if parts and parts[0]:
+            try:
+                return int(parts[0][0])
+            except (ValueError, TypeError):
+                continue
+    return None

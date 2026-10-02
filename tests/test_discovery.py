@@ -84,12 +84,30 @@ def payloads():
     ]
 
 
+class _UnresolvedCrossref:
+    """Hermetic stand-in: every DOI is unverifiable, OpenAlex stands alone."""
+
+    enabled = True
+
+    def __init__(self):
+        from types import SimpleNamespace
+
+        self.settings = SimpleNamespace(max_workers=2)
+
+    def lookup(self, doi):
+        return None
+
+    def verify(self, doi, title):
+        return {"resolved": False, "title_agrees": None}
+
+
 @pytest.fixture
 def service(engine_settings, tmp_path):
     return DiscoveryService(
         engine_settings,
         provider=FakeProvider([]),
         cache_dir=tmp_path / "discovery",
+        crossref=_UnresolvedCrossref(),
     )
 
 
@@ -107,6 +125,7 @@ class TestAdapter:
             engine_settings,
             provider=FakeProvider(payloads),
             cache_dir=tmp_path / "discovery",
+            crossref=_UnresolvedCrossref(),
         )
         # Scope includes the fixture institution so all authors qualify.
         service.provider.calls = 0
@@ -133,6 +152,7 @@ class TestAdapter:
             engine_settings,
             provider=FakeProvider([offshore]),
             cache_dir=tmp_path / "discovery",
+            crossref=_UnresolvedCrossref(),
         )
         # engine_settings scopes I1000, so the I2000 author must not surface.
         result = service.discover("offshore work")
@@ -170,6 +190,7 @@ class TestAdapter:
             settings,
             provider=OpenAlexDiscoveryProvider(settings, client=None),
             cache_dir=tmp_path / "discovery",
+            crossref=_UnresolvedCrossref(),
         )
         # Monkeypatched search: no network, provider returns the payload.
         service.provider.search = lambda query, limit=50: [offshore]
@@ -183,6 +204,7 @@ class TestAdapter:
             engine_settings,
             provider=FakeProvider(payloads),
             cache_dir=tmp_path / "discovery",
+            crossref=_UnresolvedCrossref(),
         )
         result = service.discover("graph methods")
         profile_chunks = [
@@ -201,6 +223,7 @@ class TestAdapter:
             engine_settings,
             provider=FakeProvider([]),
             cache_dir=tmp_path / "discovery",
+            crossref=_UnresolvedCrossref(),
         )
         result = service.discover("nothing matches this")
 

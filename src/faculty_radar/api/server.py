@@ -408,6 +408,10 @@ def _ondemand_search(request: SearchRequest) -> dict:
                 "works_retrieved": found.works_retrieved,
                 "api_calls": found.api_calls,
                 "scope_institutions": discovery.scope_ids,
+                "crossref_checked": found.crossref_checked,
+                "crossref_verified": found.crossref_verified,
+                "crossref_enriched": found.crossref_enriched,
+                "crossref_mismatched": found.crossref_mismatched,
                 "query": request.query.strip(),
             },
         }
@@ -429,6 +433,10 @@ def _ondemand_search(request: SearchRequest) -> dict:
         "works_retrieved": found.works_retrieved,
         "api_calls": found.api_calls,
         "scope_institutions": discovery.scope_ids,
+        "crossref_checked": found.crossref_checked,
+        "crossref_verified": found.crossref_verified,
+        "crossref_enriched": found.crossref_enriched,
+        "crossref_mismatched": found.crossref_mismatched,
         "query": request.query.strip(),
     }
     return payload
